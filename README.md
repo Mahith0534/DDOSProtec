@@ -106,25 +106,169 @@ sudo yum install nginx fail2ban iptables-services
 
 #### 1. Nginx Configuration
 ```bash
-# Copy nginx configuration
 sudo nano /etc/nginx/nginx.conf
 ```
+##### Add in http module
 ```bash
+client_body_timeout 10s;
+        client_header_timeout 10s;
+        keepalive_timeout 65;
+        send_timeout 10s;
+        limit_conn_zone $binary_remote_addr zone=conn_limit_per_ip:10m;
+        limit_conn conn_limit_per_ip 20;
+        limit_req_zone $binary_remote_addr zone=req_limit_per_ip:10m rate=5r/s;
+
+        log_format ddos '$remote_addr - [$time_local] "$request" '
+                        'Status: $status BodyBytes: $body_bytes_sent '
+                        'ReqPerSecLimit: $limit_req_status ConnLimit: $connecti>
+```
+```bash
+sudo nano /etc/nginx/sites-available/default
+```
+##### Add in server module
+```bash
+        access_log /var/log/nginx/ddos.log ddos;
+        location / {
+                # First attempt to serve request as file, then
+                # as directory, then fall back to displaying a 404.
+                limit_req zone=req_limit_per_ip burst=10 nodelay;
+                limit_conn conn_limit_per_ip 10;
+                try_files $uri $uri/ =404;
 
 ```
+```bash
+sudo nginx -t
+```
 
+```bash
+sudo systemctl reload nginx
+```
 #### 2. fail2ban Setup
 ```bash
 # Install custom filters and actions
-sudo cp configs/fail2ban/jail.local /etc/fail2ban/
-sudo cp configs/fail2ban/filters/* /etc/fail2ban/filter.d/
+sudo nano /etc/fail2ban/filter.d/nginx-req-limit.conf
+```
+
+```bash
+[nginx-http-auth]
+enabled = true
+filter = nginx-http-auth
+port = http,https
+logpath = /var/log/nginx/error.log
+maxretry = 3
+bantime = 600
+
+[nginx-botsearch]
+enabled = true
+filter = nginx-botsearch
+port = http,https
+logpath = /var/log/nginx/access.log
+maxretry = 2
+bantime = 3600
+
+[nginx-badbots]
+enabled = true
+filter = nginx-badbots
+port = http,https
+logpath = /var/log/nginx/access.log
+maxretry = 2
+bantime = 86400
+
+[nginx-req-limit]
+enabled = true
+filter = nginx-req-limit
+action = iptables-multiport[name=ReqLimit, port="http,https"]
+logpath = /var/log/nginx/error.log
+findtime = 600
+bantime = 7200
+maxretry = 10
+```
+```bash
+sudo nano /etc/fail2ban/filter.d/nginx-req-limit.conf
+```
+```bash
+[Definition]
+failregex = limiting requests, excess:.* by zone.*client: <HOST>
+ignoreregex =
+```
+```bash
+sudo systemctl enable fail2ban
+```
+
+```bash
 sudo systemctl restart fail2ban
 ```
 
+```bash
+sudo systemctl status fail2ban
+```
 #### 3. ModSecurity WAF
 ```bash
+sudo apt update && sudo apt upgrade
 # Install ModSecurity
-sudo apt install libmodsecurity3 modsecurity-crs
+sudo apt install gcc make build-essential autoconf automake libtool libcurl4-openssl-dev liblua5.3-dev libfuzzy-dev ssdeep gettext pkg-config libgeoip-dev libyajl-dev doxygen libpcre++-dev libpcre2-16-0 libpcre2-dev libpcre2-posix3 zlib1g zlib1g-dev -y
+
+cd /opt && sudo git clone https://github.com/owasp-modsecurity/ModSecurity.git
+
+cd ModSecurity
+
+cd /opt && sudo git clone https://github.com/owasp-modsecurity/ModSecurity-nginx.git
+
+sudo add-apt-repository ppa:ondrej/nginx -y
+
+sudo apt update
+
+sudo apt install nginx -y
+
+sudo systemctl enable nginx
+
+
+sudo systemctl status nginx
+
+cd /opt && sudo wget https://nginx.org/download/nginx-1.25.4.tar.gz
+
+sudo tar -xzvf nginx-1.25.4.tar.gz
+
+cd nginx-1.25.4
+
+sudo ./configure --with-compat --add-dynamic-module=/opt/ModSecurity-nginx
+
+sudo make
+
+sudo make modules
+
+sudo git submodule init
+
+sudo git submodule update
+
+sudo ./build.sh
+
+sudo ./configure
+
+sudo make
+
+sudo make install
+
+sudo cp objs/ngx_http_modsecurity_module.so /etc/nginx/modules-enabled/
+
+sudo cp /opt/ModSecurity/modsecurity.conf-recommended /etc/nginx/modsecurity.conf
+
+sudo cp /opt/ModSecurity/unicode.mapping /etc/nginx/unicode.mapping
+
+sudo nano /etc/nginx/nginx.conf
+# Add this line to main configuration
+load_module /etc/nginx/modules-enabled/ngx_http_modsecurity_module.so;
+
+sudo nano /etc/nginx/sites-enabled/default
+modsecurity on;
+modsecurity_rules_file /etc/nginx/modsecurity.conf;
+
+sudo nano /etc/nginx/modsecurity.conf
+SecRuleEngine On
+
+sudo nginx -t
+
+sudo systemctl restart nginx
 # Configure with OWASP CRS
 sudo cp configs/modsecurity/* /etc/modsecurity/
 ```
@@ -132,100 +276,166 @@ sudo cp configs/modsecurity/* /etc/modsecurity/
 #### 4. CrowdSec
 ```bash
 # Install CrowdSec
-curl -s https://install.crowdsec.net | sudo sh
-sudo cp configs/crowdsec/* /etc/crowdsec/
+curl -s https://packagecloud.io/install/repositories/crowdsec/crowdsec/script.deb.sh | sudo bash
+sudo apt install crowdsec
+sudo apt install crowdsec-firewall-bouncer-iptables
+sudo systemctl enable --now crowdsec
+sudo systemctl status crowdsec
+sudo cscli decisions list
 ```
 
 #### 5. Zeek Installation
 ```bash
 # Install Zeek
-sudo apt install zeek zeek-flowmeter
-sudo cp configs/zeek/* /opt/zeek/share/zeek/site/
+sudo apt install -y cmake make gcc g++ flex bison libpcap-dev libssl-dev python3 python3-dev swig zlib1g-dev libbz2-dev libcurl4-openssl-dev git
+git clone --recursive https://github.com/zeek/zeek
+cd zeek
+./configure
+make -j$(nproc)
+sudo make install
+zeek --version
+echo 'export PATH=/usr/local/zeek/bin:$PATH' >> ~/.bashrc
+source ~/.bashrc
+
+pip3 install zkg --user
+echo 'export PATH=$HOME/.local/bin:$PATH' >> ~/.bashrc
+source ~/.bashrc
+zkg autoconfig
+zkg install zeek/zeek-flowmeter
+@load zeek-flowmeter
+echo "@load zeek-flowmeter" | sudo tee -a /usr/local/zeek/share/zeek/site/local.zeek
+# Test Zeek
+zeek -i eth0
+# Test Zeek + Flowmeter
+sudo zeek -i enp0s3 /usr/local/zeek/share/zeek/site/flowmeter/flowmeter.zeek
 ```
 
-#### 6. Monitoring Stack
+#### 6. Machine Learning Model
+##### Extraction of features from Zeek
 ```bash
-# Deploy with Docker Compose
-docker-compose up -d prometheus grafana node-exporter
+python3 extract.py
 ```
-
-## ⚙️ Configuration
-
-### Environment Variables
+##### Import joblib file from repo
 ```bash
-export DDOS_THRESHOLD=1000
-export RATE_LIMIT=100
-export ML_MODEL_PATH="/opt/ddos-protection/models/random_forest.pkl"
-export GRAFANA_ADMIN_PASSWORD="your-secure-password"
+python3 ml.py
 ```
 
-### Key Configuration Files
-- `configs/nginx/nginx.conf` - Main Nginx configuration
-- `configs/fail2ban/jail.local` - fail2ban rules and thresholds
-- `configs/iptables/rules.v4` - iptables DDoS protection rules
-- `configs/modsecurity/main.conf` - ModSecurity WAF configuration
-- `configs/crowdsec/config.yaml` - CrowdSec behavioral analysis
-- `configs/zeek/local.zeek` - Zeek monitoring scripts
-- `docker-compose.yml` - Monitoring stack deployment
-
-## 📈 Monitoring & Dashboards
-
-### Grafana Dashboards
-- **DDoS Protection Overview**: Real-time attack statistics
-- **System Performance**: Resource utilization and health
-- **Network Traffic Analysis**: Flow patterns and anomalies
-- **ML Model Performance**: Prediction accuracy and alerts
-
-### Key Metrics
-- Requests per second and connection counts
-- Blocked IPs and attack patterns
-- System resource utilization
-- ML model prediction confidence
-- Response times and availability
-
-## 🔧 Usage
-
-### Starting the Protection System
+#### 7. Prometheus Setup
 ```bash
-# Start all services
-sudo systemctl start nginx fail2ban crowdsec zeek
-sudo iptables-restore < /etc/iptables/rules.v4
+sudo useradd --no-create-home --shell /bin/false prometheus
 
-# Start monitoring
-docker-compose up -d
+sudo mkdir /etc/prometheus
+sudo mkdir /var/lib/prometheus
 
-# Start ML detection service
-python3 ml_detector/ddos_detector.py --config configs/ml_config.yaml
+sudo chown prometheus:prometheus /var/lib/prometheus
+
+cd /tmp/
+wget https://github.com/prometheus/prometheus/releases/download/v2.46.0/prometheus-2.46.0.linux-amd64.tar.gz
+
+tar -xvf prometheus-2.46.0.linux-amd64.tar.gz
+cd prometheus-2.46.0.linux-amd64
+sudo mv console* /etc/prometheus
+sudo mv prometheus.yml /etc/prometheus
+sudo chown -R prometheus:prometheus /etc/prometheus
+
+sudo mv prometheus /usr/local/bin/
+sudo chown prometheus:prometheus /usr/local/bin/prometheus
+
+sudo nano /etc/prometheus/prometheus.yml
+sudo nano /etc/systemd/system/prometheus.service
 ```
-
-### Monitoring Commands
 ```bash
-# Check fail2ban status
-sudo fail2ban-client status
+[Unit]
+Description=Prometheus
+Wants=network-online.target
+After=network-online.target
 
-# View CrowdSec decisions
-sudo cscli decisions list
+[Service]
+User=prometheus
+Group=prometheus
+Type=simple
+ExecStart=/usr/local/bin/prometheus \
+    --config.file /etc/prometheus/prometheus.yml \
+    --storage.tsdb.path /var/lib/prometheus/ \
+    --web.console.templates=/etc/prometheus/consoles \
+    --web.console.libraries=/etc/prometheus/console_libraries
 
-# Check blocked IPs
-sudo iptables -L -n | grep DROP
-
-# Monitor Zeek logs
-tail -f /opt/zeek/logs/current/conn.log
+[Install]
+WantedBy=multi-user.target
+```
+```bash
+sudo systemctl daemon-reload
+sudo systemctl start prometheus
+sudo systemctl enable prometheus
+sudo systemctl status prometheus
 ```
 
-## 🚨 Alert Configuration
+```bash
+sudo ufw allow 9090/tcp
 
-### Prometheus Alerts
-- High request rate detection
-- System resource exhaustion
-- ML model anomaly threshold exceeded
-- Service availability issues
+http://server-IP-or-Hostname:9090
+```
 
-### Integration Options
-- **Slack/Discord**: Real-time notifications
-- **Email**: Critical alert summaries
-- **PagerDuty**: Incident management
-- **Webhook**: Custom integrations
+#### 8. Node Exporter Setup
+```bash
+cd /tmp
+wget https://github.com/prometheus/node_exporter/releases/download/v1.6.1/node_exporter-1.6.1.linux-amd64.tar.gz
+sudo tar xvfz node_exporter-*.*-amd64.tar.gz
+sudo mv node_exporter-*.*-amd64/node_exporter /usr/local/bin/
+sudo useradd -rs /bin/false node_exporter
+sudo nano /etc/systemd/system/node_exporter.service
+```
+```bash
+[Unit]
+Description=Node Exporter
+After=network.target
+
+[Service]
+User=node_exporter
+Group=node_exporter
+Type=simple
+ExecStart=/usr/local/bin/node_exporter
+
+[Install]
+WantedBy=multi-user.target
+```
+```bash
+sudo systemctl daemon-reload
+sudo systemctl start node_exporter
+sudo systemctl enable node_exporter
+sudo systemctl status node_exporter
+```
+```bash
+sudo nano /etc/prometheus/prometheus.yml
+```
+```bash
+- job_name: 'Node_Exporter'
+    scrape_interval: 5s
+    static_configs:
+      - targets: ['<Server_IP_of_Node_Exporter_Machine>:9100']
+```
+```bash
+sudo systemctl restart prometheus
+```
+
+#### 9. Install Grafana
+```bash
+wget -q -O - https://packages.grafana.com/gpg.key | sudo apt-key add -
+sudo add-apt-repository "deb https://packages.grafana.com/oss/deb stable main"
+sudo apt update
+sudo apt install grafana
+sudo systemctl start grafana-server
+sudo systemctl status grafana-server
+sudo systemctl enable grafana-server
+```
+http://your_ip:3000
+Username – admin
+Password – admin
+- Add Data Source
+- Name Prometheus and give prometheus source IP
+- Save
+- At the top right go to + icon
+- Import Dashboard, Import from Grafana.com, 14513
 
 ## 📋 Testing
 
@@ -237,24 +447,6 @@ ab -n 10000 -c 100 http://your-server/
 # Custom DDoS simulation
 python3 tests/ddos_simulator.py --target http://your-server --threads 50
 ```
-
-### Validation Scripts
-```bash
-# Test all components
-bash tests/system_test.sh
-
-# Validate ML model
-python3 tests/ml_model_test.py
-```
-
-## 🐛 Troubleshooting
-
-### Common Issues
-1. **High False Positives**: Adjust ML model threshold in `ml_config.yaml`
-2. **Legitimate Traffic Blocked**: Review and whitelist in `fail2ban/jail.local`
-3. **Performance Issues**: Tune rate limits in `nginx.conf`
-4. **Memory Usage**: Monitor Zeek and adjust retention policies
-
 ### Log Locations
 - Nginx: `/var/log/nginx/`
 - fail2ban: `/var/log/fail2ban.log`
@@ -295,13 +487,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [Zeek Network Security Monitor](https://zeek.org/)
 - [CSE-CIC-IDS2018 Dataset](https://www.unb.ca/cic/datasets/ids-2018.html)
 - [CICIDS2017 Dataset](https://www.unb.ca/cic/datasets/ids-2017.html)
-
-## 📞 Support
-
-For questions, issues, or contributions:
-- **Issues**: [GitHub Issues](../../issues)
-- **Discussions**: [GitHub Discussions](../../discussions)
-- **Email**: [your-email@domain.com]
 
 ---
 
